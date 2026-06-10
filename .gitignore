@@ -1,0 +1,34 @@
+# Secrets and local environment
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local logs/process/editor files
+*.log
+*.pid
+*.swp
+*.swo
+.DS_Store
+
+# Raw corpora and local input data
+/data/raw/
+/fir_sample_100/
+/gita20/
+/SC100/
+/Vllm_fine_tune_pdfs*/
+
+# Generated and processed pipeline outputs
+/artifacts/
+/artifacts_*/
+/artifacts-*/
