@@ -1,4 +1,6 @@
-# Indic OCR Synthetic Data Pipeline
+# vllm_ocr_translation
+
+## Indic OCR Synthetic Data Pipeline
 
 This repository contains the source code and documentation for a page-level data
 preparation pipeline for Indic OCR and Hindi-to-English OCR+translation
