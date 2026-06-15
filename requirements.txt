@@ -4,3 +4,4 @@ transformers>=5.5.0
 torch
 torchvision
 accelerate
+gemini_webapi>=2.0.0

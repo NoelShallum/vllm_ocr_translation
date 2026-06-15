@@ -21,6 +21,15 @@ __pycache__/
 *.swo
 .DS_Store
 
+# Local notebooks, one-off notes, and Gemini App cookie material
+Untitled*.ipynb
+[0-9][0-9]_[0-9][0-9]_[0-9][0-9].md
+gemini_webapi_cookie_cache*/
+.gemini_webapi_cookie_cache*/
+gemini_app_cookie*.json
+gemini_cookie*.json
+cookies.json
+
 # Raw corpora and local input data
 /data/raw/
 /fir_sample_100/
