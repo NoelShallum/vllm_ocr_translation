@@ -30,6 +30,9 @@ COOKIE_NAMES = {
 def find_browser(explicit: str | None) -> str:
     if explicit:
         return explicit
+    for path in ("/opt/brave.com/brave/brave",):
+        if Path(path).exists():
+            return path
     for name in ("brave-browser-stable", "brave-browser", "chromium", "google-chrome"):
         path = shutil.which(name)
         if path:
@@ -80,7 +83,13 @@ def launch_browser(args: argparse.Namespace, url: str) -> subprocess.Popen[str] 
         f"{profile_dir} on port {args.cdp_port}. Complete login in that window if prompted.",
         flush=True,
     )
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True)
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        start_new_session=True,
+    )
 
 
 def run_agent_browser(args: argparse.Namespace, *command: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -230,15 +239,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--browser-executable", default=os.getenv("BRAVE_BROWSER"))
     parser.add_argument("--profile-dir", default="~/.cache/gemini-techpeek-cdp-brave")
     parser.add_argument("--cdp-port", type=int, default=9222)
-    parser.add_argument("--authuser", default="2")
-    parser.add_argument("--account-substring", default="techpeek.ai")
+    parser.add_argument("--authuser", default="0")
+    parser.add_argument("--account-substring", default="techpeek.ai@gmail.com")
     parser.add_argument("--login-timeout", type=float, default=300)
     parser.add_argument("--cookie-poll-seconds", type=float, default=5)
     parser.add_argument("--cdp-timeout", type=float, default=20)
     parser.add_argument("--page-manifest", default="artifacts/page_only_v1/manifests/page_manifest.jsonl")
-    parser.add_argument("--output", default="artifacts/gemini_app_smoke_20260615_browser")
+    parser.add_argument("--output", default="artifacts/gemini_app_smoke_20_browser")
     parser.add_argument("--fir-docs", type=int, default=10)
-    parser.add_argument("--gita-images", type=int, default=5)
+    parser.add_argument("--gita-images", type=int, default=10)
     parser.add_argument("--min-sleep", type=float, default=0.8)
     parser.add_argument("--max-sleep", type=float, default=2.2)
     parser.add_argument("--model", default="auto-flash")

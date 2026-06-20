@@ -2,21 +2,21 @@
 
 This repository has two Gemini paths:
 
-- The main pipeline uses the official Gemini API with `GEMINI_API_KEY`.
+- The main OCR pipeline uses the official Gemini API with `GEMINI_API_KEY`.
 - The Gemini App smoke path uses `gemini_webapi` with browser session cookies from `gemini.google.com`.
 
-Use the Gemini App path only for controlled FIR/Gita smoke runs or experiments. Keep production pipeline changes in `scripts/indic_ocr_v1_pipeline.py` unless the app transport is intentionally being promoted.
+Keep the official `GEMINI_API_KEY` pipeline path unchanged unless the App transport is deliberately promoted. The Gemini App path is only a smoke, diagnostic, and validation path until it proves a clean 20-image FIR/Gita run.
 
-## Files and Dependencies
+## Files
 
-Relevant files:
-
+- `scripts/indic_ocr_v1_pipeline.py` is the production data pipeline.
 - `scripts/gemini_app_fir_gita_smoke.py` runs Gemini App OCR smoke tests against rendered FIR/Gita page images.
-- `scripts/gemini_app_browser_smoke.py` launches or attaches to a Brave/Chromium CDP session, extracts Gemini cookies, and runs the smoke test.
-- `requirements.txt` includes `gemini_webapi>=2.0.0`.
-- `.env.example` documents the non-secret variable names developers should set locally.
+- `scripts/gemini_app_browser_smoke.py` launches or attaches to a Brave/Chromium CDP session, extracts only required Gemini cookie values, and runs the smoke test.
+- `scripts/gemini_app_diagnostics.py` runs safe browser/App diagnostics without writing cookie values, access tokens, upload IDs, or raw model responses.
 
-Install dependencies from the repository root:
+## Install
+
+Run from the repository root:
 
 ```bash
 python3 -m venv .venv
@@ -24,26 +24,154 @@ python3 -m venv .venv
 pip install -r requirements.txt
 ```
 
-## Credential Rules
+The App workflow needs a local Brave or Chromium-family browser and `agent-browser` available on `PATH`. Do not use `sudo` for this workflow; the browser profile, CDP process, and artifacts should all be owned by your normal user.
 
-Never commit Gemini App cookies, browser profiles, notebook prototypes, or cookie cache files.
+## Dedicated Profile Setup
 
-The direct runner reads these environment variables:
+Use one dedicated browser profile for this account:
 
 ```text
-GEMINI_WEBAPI_SECURE_1PSID
-GEMINI_WEBAPI_SECURE_1PSIDTS
+~/.cache/gemini-techpeek-cdp-brave
 ```
 
-The scripts also recognize the legacy names `Secure_1PSID` and `Secure_1PSIDTS`, but new code and documentation should use the `GEMINI_WEBAPI_` names.
+Open the profile through the smoke or diagnostics scripts, or launch it manually:
 
-Prefer the browser wrapper when possible. It extracts only the required cookie values from a live browser session and passes them to the child smoke runner through environment variables. The values are not printed and are not written to repository files.
+```bash
+/opt/brave.com/brave/brave \
+  --user-data-dir="$HOME/.cache/gemini-techpeek-cdp-brave" \
+  --remote-debugging-port=9222 \
+  --remote-allow-origins='*' \
+  --no-first-run \
+  --new-window \
+  'https://accounts.google.com/AccountChooser?Email=techpeek.ai@gmail.com&continue=https%3A%2F%2Fgemini.google.com%2Fapp%3Fauthuser%3D0'
+```
 
-By default, `scripts/gemini_app_fir_gita_smoke.py` isolates the upstream `gemini_webapi` cookie refresh cache in a temporary directory and deletes it after the run. Only use `--cookie-cache-dir` for local debugging, and keep that directory ignored.
+Sign in manually as:
 
-## Direct Smoke Runner
+```text
+techpeek.ai@gmail.com
+```
 
-Use this path when you already have fresh Gemini App cookies in your environment:
+After login, keep this profile scoped to that account only. The standard App commands use:
+
+```text
+--profile-dir ~/.cache/gemini-techpeek-cdp-brave
+--authuser 0
+--account-substring techpeek.ai@gmail.com
+```
+
+## Safe Diagnostics
+
+Run diagnostics before a proof batch:
+
+```bash
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+.venv/bin/python scripts/gemini_app_diagnostics.py \
+  --profile-dir ~/.cache/gemini-techpeek-cdp-brave \
+  --authuser 0 \
+  --account-substring techpeek.ai@gmail.com \
+  --model auto-flash \
+  --output "artifacts/gemini_app_diagnostics_${ts}"
+```
+
+Diagnostics check:
+
+- CDP reachability.
+- Visible Google account text for `authuser=0`.
+- Required cookie-name presence.
+- Gemini client initialization and safe metadata: `account_status`, `access_token_present`, `session_id_present`, `push_id_present`.
+- Account-visible model listing and `auto-flash` resolution.
+- Text-only generation.
+- Upload endpoint probe.
+- One-image OCR generation through the same FIR/Gita OCR prompt and validator.
+
+Diagnostics write only safe metadata under:
+
+```text
+artifacts/gemini_app_diagnostics_<timestamp>/
+```
+
+Do not treat diagnostics as proof of batch readiness unless `diagnostics_summary.json -> ok: true`.
+
+For repeated liveness checks that should not spend an upload/OCR request, use health-only mode:
+
+```bash
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+.venv/bin/python scripts/gemini_app_diagnostics.py \
+  --profile-dir ~/.cache/gemini-techpeek-cdp-brave \
+  --authuser 0 \
+  --account-substring techpeek.ai@gmail.com \
+  --health-only \
+  --output "artifacts/gemini_app_health_${ts}"
+```
+
+Health-only mode still verifies CDP, account selection, required cookie-name presence, Gemini client bootstrap, and model listing. It skips text generation, upload, and one-image OCR.
+
+## Session Lifecycle
+
+The dedicated Brave profile is the source of truth for App authentication. The browser wrapper reads the current required Google/Gemini cookies from CDP at the start of a run and passes the values only to the child process environment.
+
+Inside `gemini_webapi`, each client initialization bootstraps fresh in-memory App session metadata:
+
+- access token presence, from the Gemini App page bootstrap value commonly called `SNlM0e`
+- session id presence
+- file-upload push id presence
+- account/model state
+
+These values can change between client initializations. A changed access token, session id, or push id is normal and is not a failure by itself. The failure condition is absence of one of the required bootstrap values, auth errors from the App RPCs, upload rejection, or generation failure.
+
+By default, the direct smoke runner points `GEMINI_COOKIE_PATH` at a temporary directory and deletes it after the run. That means refreshed `gemini_webapi` cookies are not persisted to the repository or to a long-lived cache; the next browser-wrapper run reads fresh cookies from the logged-in Brave profile again.
+
+## What Makes The App Transport Stop Working
+
+Known causes are:
+
+- The CDP browser is closed, sleeping, on the wrong port, or launched against a different profile.
+- The dedicated profile is signed out or is blocked by a Google challenge, TOS prompt, account chooser, or Gemini interstitial.
+- Multiple Google accounts in the same profile make `authuser=0` point at the wrong account.
+- The timestamp auth cookie expires or cannot rotate.
+- The Gemini App bootstrap page stops exposing the access token metadata needed by `gemini_webapi`.
+- The account-visible model registry changes and `auto-flash` can no longer resolve a usable Flash model.
+- The content upload endpoint rejects the session or file.
+- Gemini returns an upstream App/RPC shape that the current `gemini_webapi` package cannot parse, often surfaced as `APIError 1100`.
+- The account, model, or IP hits usage, quota, rate, or temporary block limits.
+- A request times out during upload, streaming generation, or the pre-request App activity RPC.
+
+Operationally, treat session id changes as normal rotation. Treat missing bootstrap values, auth failures, upload failures, and repeated timeouts as broken-session evidence. Recovery starts with a health-only diagnostic; if that passes but upload/OCR fails, run full diagnostics; if full diagnostics fails, refresh or relogin the dedicated profile before retrying the proof batch.
+
+## 20-Image Validation
+
+Run the 20-image proof with 10 FIR first pages and 10 Gita images:
+
+```bash
+ts="$(date -u +%Y%m%dT%H%M%SZ)"
+.venv/bin/python scripts/gemini_app_browser_smoke.py \
+  --profile-dir ~/.cache/gemini-techpeek-cdp-brave \
+  --authuser 0 \
+  --account-substring techpeek.ai@gmail.com \
+  --fir-docs 10 \
+  --gita-images 10 \
+  --model auto-flash \
+  --output "artifacts/gemini_app_smoke_20_${ts}"
+```
+
+Acceptance requires:
+
+```text
+reports/gemini_app_smoke_summary.json -> attempted_pages: 20
+reports/gemini_app_smoke_summary.json -> failures: 0
+reports/gemini_app_smoke_summary.json -> success_rate: 1.0
+reports/gemini_app_runs.jsonl -> every row has status: accepted
+```
+
+The deterministic sample selection is:
+
+- FIR: first rendered page from 10 distinct FIR documents.
+- Gita: first 10 rendered Gita rows sorted by source path and page id.
+
+## Direct Runner
+
+Use the direct runner only when fresh Gemini App cookies are already in your local environment:
 
 ```bash
 export GEMINI_WEBAPI_SECURE_1PSID='fresh-cookie-value'
@@ -53,129 +181,70 @@ export GEMINI_WEBAPI_SECURE_1PSIDTS='fresh-cookie-value'
   --page-manifest artifacts/page_only_v1/manifests/page_manifest.jsonl \
   --output artifacts/gemini_app_smoke_local \
   --fir-docs 10 \
-  --gita-images 5 \
+  --gita-images 10 \
   --model auto-flash
 ```
 
-The runner selects rendered FIR first pages and Gita images from the page manifest, sends each image to Gemini App with the OCR JSON prompt, validates the response with the existing pipeline validators, and writes run artifacts under the selected output directory.
+Prefer the browser wrapper because it extracts the required cookie values from the live CDP profile and passes them to the child process through environment variables. It does not print or write those values.
 
-All normal outputs belong under `artifacts/`, which is ignored.
+## Outputs
 
-Important output files:
+Smoke outputs are written under the selected `artifacts/` directory:
 
 ```text
-artifacts/<run-name>/manifests/selected_pages.jsonl
-artifacts/<run-name>/reports/gemini_app_runs.jsonl
-artifacts/<run-name>/reports/gemini_app_raw_responses.jsonl
-artifacts/<run-name>/reports/gemini_app_failures.jsonl
-artifacts/<run-name>/reports/gemini_app_smoke_summary.json
+manifests/selected_pages.jsonl
+reports/gemini_app_runs.jsonl
+reports/gemini_app_raw_responses.jsonl
+reports/gemini_app_failures.jsonl
+reports/gemini_app_smoke_summary.json
 ```
 
-## Browser/CDP Smoke Runner
+Diagnostics outputs are:
 
-Use this path when the cookies should come from a logged-in browser session:
-
-```bash
-.venv/bin/python scripts/gemini_app_browser_smoke.py \
-  --fir-docs 10 \
-  --gita-images 5 \
-  --output artifacts/gemini_app_smoke_browser \
-  --login-timeout 300 \
-  --cookie-poll-seconds 5
+```text
+diagnostics_steps.jsonl
+diagnostics_summary.json
 ```
 
-Default behavior:
+`artifacts/` is ignored by Git.
 
-- Uses Brave/Chromium with remote debugging on port `9222`.
-- Uses a dedicated profile at `~/.cache/gemini-techpeek-cdp-brave`.
-- Opens `https://gemini.google.com/app?authuser=2`.
-- Waits for Google/Gemini cookies to become available.
-- Confirms the visible account contains `techpeek.ai` when possible.
-- Runs `scripts/gemini_app_fir_gita_smoke.py` with browser-derived cookies.
+## Failure Matrix
 
-Useful overrides:
+| Failure | Likely cause | Recovery |
+| --- | --- | --- |
+| CDP unavailable | Browser is not running on `9222`, port mismatch, or profile launch failed | Start the dedicated profile with `--remote-debugging-port=9222`; close conflicting browsers using the same profile; retry diagnostics |
+| Signed-out profile | `__Secure-1PSID` is missing | Open the dedicated profile and sign in to `techpeek.ai@gmail.com` manually |
+| `authuser` mismatch | Browser is signed in, but `authuser=0` shows another account | Remove extra accounts from that dedicated profile or sign out and sign back in with only `techpeek.ai@gmail.com`; keep `--authuser 0` |
+| Stale cookies | Client init or generation returns auth/401 errors | Refresh `https://gemini.google.com/app?authuser=0`, confirm the account is still signed in, then rerun diagnostics |
+| `__Secure-1PSIDTS` rotation failure | Session timestamp cookie is missing, expired, or cannot refresh | Reopen Gemini in the dedicated profile and complete any account challenge; rerun diagnostics before batch proof |
+| Missing `SNlM0e` | Gemini App page bootstrapping did not expose the access token | Refresh Gemini, confirm no interstitial/TOS/account challenge is blocking the app, then rerun diagnostics |
+| `APIError 1100` | App transport accepted auth but failed upload/generation RPC structure | Use diagnostics to classify whether upload probe or OCR generation failed; do not claim App API success until the 20-image proof is clean |
+| Upload failure | Content upload endpoint rejected the file or session | Confirm manual image upload works in Gemini UI; rerun diagnostics; refresh/relogin if needed |
+| Timeout | Gemini or upload call exceeded configured timeout | Retry once; if repeated, increase `--request-timeout` or wait for service recovery |
+| Rate or usage block | Gemini usage limit, quota, or temporary IP/account block | Stop batch runs and wait for cooldown; rerun diagnostics before another proof |
+| Model drift | `auto-flash` cannot resolve an account-visible Flash model | Inspect `model_names` in diagnostics; pass an explicit available model only for debugging |
 
-```bash
-.venv/bin/python scripts/gemini_app_browser_smoke.py \
-  --browser-executable /path/to/brave-or-chromium \
-  --profile-dir ~/.cache/gemini-techpeek-cdp-brave \
-  --cdp-port 9222 \
-  --authuser 2 \
-  --account-substring techpeek.ai \
-  --output artifacts/gemini_app_smoke_browser
-```
+## Secret Rules
 
-If the dedicated browser profile is signed out, complete the login manually in that launched browser window once, then rerun the command.
+Never commit:
 
-## Model Selection
+- Gemini App cookie values or cookie JSON files.
+- Notebook prototypes containing cookies.
+- Browser profile directories.
+- `gemini_webapi` cookie cache directories.
+- `.env` files.
+- Generated `artifacts/` outputs.
 
-The default `--model auto-flash` mode asks the Gemini App account which models are visible through `client.list_models()`.
+Do not print cookie values in terminal logs. Do not paste them into issues or docs. Do not run this workflow with `sudo`.
 
-Resolution order:
-
-- Prefer account-visible `gemini-3.5-flash` variants.
-- Fall back to account-visible `gemini-3-flash` variants.
-- Prefer non-thinking Flash models when both thinking and non-thinking models are listed.
-- Record the requested and resolved model in `gemini_app_runs.jsonl` and `gemini_app_smoke_summary.json`.
-
-Use an explicit model only when debugging a known account-visible model:
-
-```bash
-.venv/bin/python scripts/gemini_app_fir_gita_smoke.py \
-  --model gemini-3-flash \
-  --output artifacts/gemini_app_explicit_model
-```
-
-## Making Changes Safely
+## Change Boundaries
 
 Prompt changes belong in `ocr_prompt()` inside `scripts/gemini_app_fir_gita_smoke.py`.
 
 Keep these invariants:
 
-- The response must be JSON only.
+- Gemini responses must be JSON only.
 - Expected top-level keys must remain compatible with `pipeline.validate_teacher_payload`.
-- The prompt must not ask Gemini to translate FIR/Gita OCR text.
-- The first response character should be `{` and the last should be `}`.
-
-Sample selection changes belong in `select_pages()`.
-
-Keep these invariants:
-
-- FIR samples should select first rendered page per FIR document unless the experiment explicitly changes that scope.
-- Gita samples should come from rendered page rows with an existing `render_path`.
+- The App prompt must not ask Gemini to translate FIR/Gita OCR text.
 - Missing rendered inputs should fail clearly instead of silently sending incomplete batches.
-
-Transport or credential changes should preserve these rules:
-
-- Do not print cookie values.
-- Do not write cookie values into repository files.
-- Keep generated outputs under `artifacts/`.
-- Keep the direct runner usable without a browser when env vars are already set.
-- Keep the browser runner as a wrapper around the direct runner, not a second OCR implementation.
-
-## Known Failure Modes
-
-`APIError 1100` during image/file generation usually means the Gemini App session is stale, not fully authenticated, or the account/browser session cannot upload files through the app transport. Text-only calls may still work with the same cookies.
-
-If this happens:
-
-- Refresh the Gemini App browser session.
-- Confirm image upload works manually in the web UI.
-- Re-run the browser/CDP wrapper to extract fresh cookies.
-- Check `gemini_app_failures.jsonl` and `gemini_app_smoke_summary.json`.
-
-If no cookies are found, the browser profile is not logged in for the selected `authuser`. Complete login in the launched browser profile or pass the correct `--authuser`.
-
-## What Not to Commit
-
-Do not commit:
-
-- `Untitled*.ipynb`
-- Dated migration notes like `15_06_26.md`
-- `artifacts/` run outputs
-- Gemini cookie JSON files
-- `gemini_webapi` cookie cache directories
-- Browser profile directories
-- `.env` files
-
-Commit source code, documentation, and dependency declarations only.
+- The browser wrapper should remain a credential wrapper around the direct runner, not a second OCR implementation.

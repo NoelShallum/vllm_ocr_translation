@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
 import tempfile
 import time
@@ -28,6 +29,8 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import indic_ocr_v1_pipeline as pipeline  # noqa: E402
 from gemini_webapi import GeminiClient  # noqa: E402
 from gemini_webapi.constants import Model  # noqa: E402
+
+INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
 
 
 def utc_now() -> str:
@@ -172,6 +175,60 @@ def response_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def repair_invalid_json_escapes(text: str) -> str:
+    return INVALID_JSON_ESCAPE_RE.sub(r"\\\\", text)
+
+
+def parse_ocr_json_response(text: str) -> Any:
+    decoder = json.JSONDecoder()
+    stripped = text.strip()
+    variants = [
+        stripped,
+        pipeline.escape_json_string_controls(stripped),
+        repair_invalid_json_escapes(pipeline.escape_json_string_controls(stripped)),
+    ]
+    candidates: list[Any] = []
+    seen: set[str] = set()
+    for variant in variants:
+        if not variant or variant in seen:
+            continue
+        seen.add(variant)
+        try:
+            value = json.loads(variant)
+            if isinstance(value, dict) and pipeline.GEMINI_REQUIRED_FIELDS.issubset(value):
+                return value
+            candidates.append(value)
+        except json.JSONDecodeError:
+            pass
+
+        for idx, char in enumerate(variant):
+            if char not in "{[":
+                continue
+            try:
+                value, _ = decoder.raw_decode(variant[idx:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict) and pipeline.GEMINI_REQUIRED_FIELDS.issubset(value):
+                return value
+            if isinstance(value, list) and any(
+                isinstance(item, dict) and pipeline.GEMINI_REQUIRED_FIELDS.issubset(item)
+                for item in value
+            ):
+                return value
+            candidates.append(value)
+
+    scored = [
+        (len(pipeline.GEMINI_REQUIRED_FIELDS.intersection(value)), value)
+        for value in candidates
+        if isinstance(value, dict)
+    ]
+    if scored:
+        score, value = max(scored, key=lambda item: item[0])
+        if score > 0:
+            return value
+    return pipeline.parse_json_response(text)
+
+
 def available_model_rows(client: GeminiClient) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for model in client.list_models() or []:
@@ -311,7 +368,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
                 else:
                     response = await client.generate_content(prompt, files=[image_path], model=selected_model, **request_kwargs)
                 raw_text = response.text or ""
-                parsed = pipeline.parse_json_response(raw_text)
+                parsed = parse_ocr_json_response(raw_text)
                 ok, errors, normalized = pipeline.validate_teacher_payload(parsed, min_confidence)
                 status = {
                     "ok": ok,
@@ -430,10 +487,10 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--page-manifest", default="artifacts/page_only_v1/manifests/page_manifest.jsonl")
-    parser.add_argument("--output", default="artifacts/gemini_app_smoke_20260615")
+    parser.add_argument("--output", default="artifacts/gemini_app_smoke_local")
     parser.add_argument("--notebook", default="Untitled3.ipynb")
     parser.add_argument("--fir-docs", type=int, default=10)
-    parser.add_argument("--gita-images", type=int, default=5)
+    parser.add_argument("--gita-images", type=int, default=10)
     parser.add_argument("--min-sleep", type=float, default=0.8)
     parser.add_argument("--max-sleep", type=float, default=2.2)
     parser.add_argument("--min-confidence", type=float, default=0.60)

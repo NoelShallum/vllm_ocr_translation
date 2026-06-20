@@ -25,12 +25,18 @@ Gemini is used as the synthetic OCR teacher for FIR and Gita pages only.
 Supreme Court English targets come from native English PDF text extraction, not
 Gemini translation.
 
+For the separate Gemini App diagnostic and 20-image FIR/Gita validation
+workflow, see [inference.md](inference.md).
+
 ## Repository Layout
 
 ```text
 .
 |-- scripts/
 |   |-- indic_ocr_v1_pipeline.py
+|   |-- gemini_app_browser_smoke.py
+|   |-- gemini_app_diagnostics.py
+|   |-- gemini_app_fir_gita_smoke.py
 |   |-- gemma_resume_loop.sh
 |   |-- gemma_resume_loop_start.sh
 |   |-- gemma_resume_loop_status.sh
@@ -41,6 +47,7 @@ Gemini translation.
 |-- .env.example
 |-- .gitignore
 |-- CONTRIBUTING.md
+|-- inference.md
 |-- ocr_strategy_research_report.md
 |-- plan.md
 `-- requirements.txt
