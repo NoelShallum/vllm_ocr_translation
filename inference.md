@@ -2,14 +2,15 @@
 
 This repository has two Gemini paths:
 
-- The main OCR pipeline uses the official Gemini API with `GEMINI_API_KEY`.
-- The Gemini App smoke path uses `gemini_webapi` with browser session cookies from `gemini.google.com`.
+- The main OCR pipeline defaults to Gemini App transport with `gemini_webapi` and browser session cookies from `gemini.google.com`.
+- The official Gemini API path remains available with `--gemini-transport official` and `GEMINI_API_KEY`.
 
-Keep the official `GEMINI_API_KEY` pipeline path unchanged unless the App transport is deliberately promoted. The Gemini App path is only a smoke, diagnostic, and validation path until it proves a clean 20-image FIR/Gita run.
+Gemini App diagnostics and smoke scripts are still useful for account/session checks, but the production FIR/Gita pipeline can now use the App transport directly.
 
 ## Files
 
 - `scripts/indic_ocr_v1_pipeline.py` is the production data pipeline.
+- `scripts/gemini_app_client.py` contains shared Gemini App helpers used by the pipeline and smoke tools.
 - `scripts/gemini_app_fir_gita_smoke.py` runs Gemini App OCR smoke tests against rendered FIR/Gita page images.
 - `scripts/gemini_app_browser_smoke.py` launches or attaches to a Brave/Chromium CDP session, extracts only required Gemini cookie values, and runs the smoke test.
 - `scripts/gemini_app_diagnostics.py` runs safe browser/App diagnostics without writing cookie values, access tokens, upload IDs, or raw model responses.
@@ -25,6 +26,31 @@ pip install -r requirements.txt
 ```
 
 The App workflow needs a local Brave or Chromium-family browser and `agent-browser` available on `PATH`. Do not use `sudo` for this workflow; the browser profile, CDP process, and artifacts should all be owned by your normal user.
+
+## Production Pipeline Usage
+
+Set App transport in `.env`:
+
+```text
+GEMINI_TRANSPORT=app
+GEMINI_APP_MODEL=auto-flash
+GEMINI_APP_TEACHER_MODEL_KEY=gemini_webapi:auto-flash
+GEMINI_WEBAPI_SECURE_1PSID=...
+GEMINI_WEBAPI_SECURE_1PSIDTS=...
+```
+
+Run FIR/Gita OCR through the main pipeline:
+
+```bash
+.venv/bin/python scripts/indic_ocr_v1_pipeline.py \
+  --output artifacts/fir_gita_ocr_v1 \
+  run-fir-gita \
+  --gemini-transport app
+```
+
+If the cookies should be read from the signed-in CDP browser at run time, add
+`--browser-extract-cookies`. To use the official REST API fallback instead, set
+`GEMINI_API_KEY` and pass `--gemini-transport official`.
 
 ## Dedicated Profile Setup
 

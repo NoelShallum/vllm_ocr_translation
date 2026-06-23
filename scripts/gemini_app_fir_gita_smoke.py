@@ -9,13 +9,10 @@ test, from the untracked notebook that demonstrated the method.
 from __future__ import annotations
 
 import argparse
-import ast
 import asyncio
-import hashlib
 import json
 import os
 import random
-import re
 import sys
 import tempfile
 import time
@@ -26,11 +23,8 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import gemini_app_client as app_client  # noqa: E402
 import indic_ocr_v1_pipeline as pipeline  # noqa: E402
-from gemini_webapi import GeminiClient  # noqa: E402
-from gemini_webapi.constants import Model  # noqa: E402
-
-INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrtu])')
 
 
 def utc_now() -> str:
@@ -53,61 +47,6 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
 def write_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-
-
-def dotenv_values(path: Path) -> dict[str, str]:
-    values: dict[str, str] = {}
-    if not path.exists():
-        return values
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
-    return values
-
-
-def notebook_assignment_values(path: Path) -> dict[str, str]:
-    if not path.exists():
-        return {}
-    notebook = json.loads(path.read_text(encoding="utf-8"))
-    values: dict[str, str] = {}
-    for cell in notebook.get("cells", []):
-        if cell.get("cell_type") != "code":
-            continue
-        source = "".join(cell.get("source") or [])
-        try:
-            tree = ast.parse(source)
-        except SyntaxError:
-            continue
-        for node in tree.body:
-            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Constant):
-                continue
-            if not isinstance(node.value.value, str):
-                continue
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id in {"Secure_1PSID", "Secure_1PSIDTS"}:
-                    values[target.id] = node.value.value
-    return values
-
-
-def load_webapi_credentials(notebook_path: Path) -> tuple[str, str, str]:
-    env = {**dotenv_values(ROOT / ".env"), **os.environ}
-    psid = env.get("GEMINI_WEBAPI_SECURE_1PSID") or env.get("Secure_1PSID")
-    psidts = env.get("GEMINI_WEBAPI_SECURE_1PSIDTS") or env.get("Secure_1PSIDTS")
-    source = "environment"
-    if not psid or not psidts:
-        notebook_values = notebook_assignment_values(notebook_path)
-        psid = psid or notebook_values.get("Secure_1PSID")
-        psidts = psidts or notebook_values.get("Secure_1PSIDTS")
-        source = f"notebook:{notebook_path.name}"
-    if not psid or not psidts:
-        raise RuntimeError(
-            "Missing Gemini App credentials. Set GEMINI_WEBAPI_SECURE_1PSID and "
-            "GEMINI_WEBAPI_SECURE_1PSIDTS, or pass --notebook with the local demo notebook."
-        )
-    return psid, psidts, source
 
 
 def select_pages(page_manifest: Path, fir_docs: int, gita_images: int) -> list[dict[str, Any]]:
@@ -157,143 +96,6 @@ def select_pages(page_manifest: Path, fir_docs: int, gita_images: int) -> list[d
     return selected
 
 
-def ocr_prompt() -> str:
-    return (
-        "You are an OCR expert for Indian legal, police, and Indic book pages. "
-        "Transcribe only visible text from this full page image. Preserve script, spelling, "
-        "line breaks, page numbers, tables, stamps, signatures, handwritten regions, form labels, "
-        "and illegible markers. Return valid JSON only with exactly these top-level keys: "
-        "plain_text, markdown, blocks, key_values, tables, quality_flags, confidence. "
-        "Blocks must be an ordered list with text, type, bbox, language, and confidence when visible. "
-        "Do not translate. Do not explain your reasoning. Do not include markdown fences or any text "
-        "outside JSON. The first character of your response must be { and the last character must be }. "
-        "For unclear handwriting, write your best single reading once and use [illegible] for unreadable spans."
-    )
-
-
-def response_hash(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def repair_invalid_json_escapes(text: str) -> str:
-    return INVALID_JSON_ESCAPE_RE.sub(r"\\\\", text)
-
-
-def parse_ocr_json_response(text: str) -> Any:
-    decoder = json.JSONDecoder()
-    stripped = text.strip()
-    variants = [
-        stripped,
-        pipeline.escape_json_string_controls(stripped),
-        repair_invalid_json_escapes(pipeline.escape_json_string_controls(stripped)),
-    ]
-    candidates: list[Any] = []
-    seen: set[str] = set()
-    for variant in variants:
-        if not variant or variant in seen:
-            continue
-        seen.add(variant)
-        try:
-            value = json.loads(variant)
-            if isinstance(value, dict) and pipeline.GEMINI_REQUIRED_FIELDS.issubset(value):
-                return value
-            candidates.append(value)
-        except json.JSONDecodeError:
-            pass
-
-        for idx, char in enumerate(variant):
-            if char not in "{[":
-                continue
-            try:
-                value, _ = decoder.raw_decode(variant[idx:])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict) and pipeline.GEMINI_REQUIRED_FIELDS.issubset(value):
-                return value
-            if isinstance(value, list) and any(
-                isinstance(item, dict) and pipeline.GEMINI_REQUIRED_FIELDS.issubset(item)
-                for item in value
-            ):
-                return value
-            candidates.append(value)
-
-    scored = [
-        (len(pipeline.GEMINI_REQUIRED_FIELDS.intersection(value)), value)
-        for value in candidates
-        if isinstance(value, dict)
-    ]
-    if scored:
-        score, value = max(scored, key=lambda item: item[0])
-        if score > 0:
-            return value
-    return pipeline.parse_json_response(text)
-
-
-def available_model_rows(client: GeminiClient) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-    for model in client.list_models() or []:
-        rows.append({
-            "model_name": str(getattr(model, "model_name", "")),
-            "display_name": str(getattr(model, "display_name", "")),
-            "description": str(getattr(model, "description", "")),
-            "is_available": bool(getattr(model, "is_available", True)),
-            "advanced_only": bool(getattr(model, "advanced_only", False)),
-        })
-    return rows
-
-
-def resolve_requested_model(client: GeminiClient, requested: str) -> tuple[Any, dict[str, Any]]:
-    requested = requested.strip()
-    if not requested or requested == "default":
-        return Model.UNSPECIFIED, {"requested": requested or "default", "resolved": "unspecified", "source": "default"}
-    if requested != "auto-flash":
-        return requested, {"requested": requested, "resolved": requested, "source": "explicit"}
-
-    models = [model for model in client.list_models() or [] if bool(getattr(model, "is_available", True))]
-    flash_models = [
-        model for model in models
-        if "flash" in str(getattr(model, "model_name", "")).lower()
-        or "flash" in str(getattr(model, "display_name", "")).lower()
-    ]
-    preferred_names = [
-        "gemini-3.5-flash",
-        "gemini-3-5-flash",
-        "gemini-3.5-flash-plus",
-        "gemini-3.5-flash-advanced",
-        "gemini-3-flash",
-        "gemini-3-flash-plus",
-        "gemini-3-flash-advanced",
-    ]
-    by_name = {str(getattr(model, "model_name", "")): model for model in flash_models}
-    for name in preferred_names:
-        if name in by_name:
-            model = by_name[name]
-            return model, {
-                "requested": "auto-flash",
-                "resolved": str(getattr(model, "model_name", name)),
-                "display_name": str(getattr(model, "display_name", "")),
-                "source": "dynamic_registry",
-            }
-    if flash_models:
-        non_thinking = [
-            model for model in flash_models
-            if "thinking" not in str(getattr(model, "model_name", "")).lower()
-        ]
-        candidates = non_thinking or flash_models
-        model = sorted(candidates, key=lambda item: str(getattr(item, "model_name", "")))[-1]
-        return model, {
-            "requested": "auto-flash",
-            "resolved": str(getattr(model, "model_name", "")),
-            "display_name": str(getattr(model, "display_name", "")),
-            "source": "dynamic_registry_fallback",
-        }
-    return Model.BASIC_FLASH, {
-        "requested": "auto-flash",
-        "resolved": Model.BASIC_FLASH.model_name,
-        "source": "enum_fallback",
-    }
-
-
 async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
     output = ROOT / args.output if not Path(args.output).is_absolute() else Path(args.output)
     report_dir = output / "reports"
@@ -307,7 +109,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
     selected_path.parent.mkdir(parents=True, exist_ok=True)
     pipeline.jsonl_write(selected_path, pages)
 
-    psid, psidts, credential_source = load_webapi_credentials(ROOT / args.notebook)
+    psid, psidts, credential_source = app_client.load_webapi_credentials(ROOT / args.notebook)
     previous_cookie_path = os.environ.get("GEMINI_COOKIE_PATH")
     temporary_cookie_cache: tempfile.TemporaryDirectory[str] | None = None
     if args.cookie_cache_dir:
@@ -320,17 +122,17 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
         os.environ["GEMINI_COOKIE_PATH"] = temporary_cookie_cache.name
         cookie_cache_mode = "temporary_deleted_after_run"
 
-    client = GeminiClient(psid, psidts, proxy=args.proxy)
+    client = None
     try:
-        await client.init(
-            timeout=args.init_timeout,
-            auto_close=False,
-            close_delay=300,
-            auto_refresh=True,
+        client = await app_client.init_app_client(
+            psid,
+            psidts,
+            proxy=args.proxy,
+            init_timeout=args.init_timeout,
             verbose=args.verbose,
         )
-        selected_model, model_info = resolve_requested_model(client, args.model)
-        available_models = available_model_rows(client)
+        selected_model, model_info = app_client.resolve_requested_model(client, args.model)
+        available_models = app_client.available_model_rows(client)
     except Exception:
         if temporary_cookie_cache:
             temporary_cookie_cache.cleanup()
@@ -340,7 +142,6 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
             os.environ["GEMINI_COOKIE_PATH"] = previous_cookie_path
         raise
 
-    prompt = ocr_prompt()
     min_confidence = float(args.min_confidence)
     successes = 0
     failures = 0
@@ -354,28 +155,36 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
             sleep_values.append(delay)
             await asyncio.sleep(delay)
 
-            image_path = ROOT / str(page["render_path"])
             started = time.time()
             raw_text = ""
             status: dict[str, Any]
             normalized: dict[str, Any] | None = None
             try:
-                request_kwargs: dict[str, Any] = {"temporary": True}
-                if args.request_timeout:
-                    request_kwargs["timeout"] = args.request_timeout
-                if selected_model is Model.UNSPECIFIED:
-                    response = await client.generate_content(prompt, files=[image_path], **request_kwargs)
+                parsed, call_status, raw_text = await app_client.call_gemini_app_page(
+                    page=page,
+                    client=client,
+                    selected_model=selected_model,
+                    model_key=f"gemini_webapi:{args.model}",
+                    model_info=model_info,
+                    request_timeout=args.request_timeout,
+                )
+                if parsed is None:
+                    status = {
+                        **call_status,
+                        "ok": False,
+                        "status": "call_failed",
+                        "validation_errors": [],
+                    }
                 else:
-                    response = await client.generate_content(prompt, files=[image_path], model=selected_model, **request_kwargs)
-                raw_text = response.text or ""
-                parsed = parse_ocr_json_response(raw_text)
-                ok, errors, normalized = pipeline.validate_teacher_payload(parsed, min_confidence)
-                status = {
-                    "ok": ok,
-                    "status": "accepted" if ok else "invalid_json_or_quality",
-                    "validation_errors": errors,
-                    "confidence": normalized.get("confidence") if normalized else None,
-                }
+                    ok, errors, normalized = pipeline.validate_teacher_payload(parsed, min_confidence)
+                    status = {
+                        "ok": ok,
+                        "status": "accepted" if ok else "invalid_json_or_quality",
+                        "validation_errors": errors,
+                        "confidence": normalized.get("confidence") if normalized else None,
+                        "error_type": call_status.get("error_type"),
+                        "error": call_status.get("error"),
+                    }
             except Exception as exc:  # noqa: BLE001 - smoke runner must log exact API failures.
                 status = {
                     "ok": False,
@@ -393,8 +202,12 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
                 "corpus": page["corpus"],
                 "sample_kind": page["sample_kind"],
                 "raw_response": raw_text,
-                "response_hash": response_hash(raw_text) if raw_text else None,
+                "response_hash": app_client.response_hash(raw_text) if raw_text else None,
             }
+            status_for_row = dict(status)
+            status_for_row.pop("model", None)
+            status_for_row.pop("model_info", None)
+            status_for_row.pop("transport", None)
             run_row = {
                 "created_at": utc_now(),
                 "index": index,
@@ -409,7 +222,7 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
                 "transport": "gemini_webapi",
                 "credential_source": credential_source,
                 "model": model_info,
-                **status,
+                **status_for_row,
             }
             append_jsonl(raw_path, raw_row)
             append_jsonl(run_path, run_row)
@@ -438,7 +251,8 @@ async def run_batch(args: argparse.Namespace) -> dict[str, Any]:
                 flush=True,
             )
     finally:
-        await client.close()
+        if client is not None:
+            await client.close()
         if temporary_cookie_cache:
             temporary_cookie_cache.cleanup()
         if previous_cookie_path is None:

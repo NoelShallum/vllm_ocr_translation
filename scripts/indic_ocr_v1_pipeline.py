@@ -8,6 +8,7 @@ full-page image input and no crop-level rows are emitted.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import base64
 import hashlib
 import json
@@ -18,6 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -58,6 +60,25 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
             continue
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def gemini_transport_from_args(args: argparse.Namespace | None = None) -> str:
+    transport = str(getattr(args, "gemini_transport", None) or os.getenv("GEMINI_TRANSPORT", "app")).strip().lower()
+    if transport not in {"app", "official"}:
+        raise RuntimeError(f"Unsupported Gemini transport {transport!r}; expected app or official.")
+    return transport
+
+
+def gemini_app_model_from_args(args: argparse.Namespace | None = None) -> str:
+    return str(getattr(args, "gemini_app_model", None) or os.getenv("GEMINI_APP_MODEL", "auto-flash")).strip() or "auto-flash"
+
+
+def active_teacher_model(args: argparse.Namespace | None = None) -> str:
+    if gemini_transport_from_args(args) == "app":
+        if getattr(args, "gemini_app_model", None):
+            return f"gemini_webapi:{gemini_app_model_from_args(args)}"
+        return os.getenv("GEMINI_APP_TEACHER_MODEL_KEY") or f"gemini_webapi:{gemini_app_model_from_args(args)}"
+    return os.getenv("GEMINI_TEACHER_MODEL", "gemma-4-31b-it")
 
 
 def utc_now() -> str:
@@ -1320,11 +1341,20 @@ def call_gemini(page: dict[str, Any], model: str, api_key: str) -> tuple[Any | N
 
 def is_quota_status(status: dict[str, Any]) -> bool:
     detail = str(status.get("error") or "")
+    detail_l = detail.lower()
+    error_type = str(status.get("error_type") or "")
+    error_type_l = error_type.lower()
     return (
         "RESOURCE_EXHAUSTED" in detail
         or "Quota exceeded" in detail
         or '"code": 429' in detail
         or "code\": 429" in detail
+        or "status: 429" in detail_l
+        or "usage limit exceeded" in detail_l
+        or "rate limit" in detail_l
+        or "too many requests" in detail_l
+        or error_type == "UsageLimitExceeded"
+        or error_type_l == "temporarilyblocked"
     )
 
 
@@ -1348,6 +1378,9 @@ def is_retry_neutral_transient_failure(status: dict[str, Any]) -> bool:
                 or "currently experiencing high demand" in detail
             )
         )
+        or status.get("error_type") in {"TimeoutError", "ConnectionError"}
+        or "temporarily unavailable" in detail
+        or "try again later" in detail
     )
 
 
@@ -1918,16 +1951,284 @@ def annotate_gemini_page(
     return {"raw_rows": raw_rows, "run_row": run_row, "failure_row": failure_row, "gold": gold}
 
 
+def extract_gemini_app_browser_cookies() -> str:
+    import gemini_app_browser_smoke as browser_smoke
+
+    browser_args = browser_smoke.parse_args([])
+    gemini_url = f"https://gemini.google.com/app?authuser={browser_args.authuser}"
+    browser_smoke.launch_browser(browser_args, gemini_url)
+    browser_smoke.wait_for_cdp(browser_args.cdp_port, browser_args.cdp_timeout)
+    browser_smoke.open_gemini(browser_args)
+    cookie_env, cookie_metadata = browser_smoke.cookie_env_from_browser(browser_args)
+    os.environ.update(cookie_env)
+    print(
+        "Extracted required Gemini cookie names from browser: "
+        f"{', '.join(cookie_metadata['found_cookie_names'])}.",
+        flush=True,
+    )
+    account_status = browser_smoke.verify_account(browser_args)
+    if account_status["status"] == "confirmed":
+        print("Confirmed Google account selection for Gemini App cookies.", flush=True)
+    else:
+        print("Gemini App browser cookie account check was not confirmed; continuing with extracted cookies.", flush=True)
+    browser_smoke.open_gemini(browser_args)
+    return "browser"
+
+
+async def annotate_gemini_app_page(
+    page: dict[str, Any],
+    client: Any,
+    selected_model: Any,
+    model: str,
+    model_info: dict[str, Any],
+    credential_source: str,
+    min_confidence: float,
+    request_lock: asyncio.Lock,
+    last_request_at: dict[str, float],
+    min_request_interval: float,
+    request_timeout: float,
+) -> dict[str, Any]:
+    import gemini_app_client as app_client
+
+    raw_rows: list[dict[str, Any]] = []
+    final_status: dict[str, Any] = {}
+    accepted: dict[str, Any] | None = None
+    invalid_attempts = 0
+    total_attempts = 0
+    max_total_attempts = int(os.getenv("GEMINI_MAX_TOTAL_ATTEMPTS", "12"))
+
+    while invalid_attempts < 3 and total_attempts < max_total_attempts:
+        async with request_lock:
+            wait_seconds = min_request_interval - (time.time() - last_request_at["value"])
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+            last_request_at["value"] = time.time()
+        total_attempts += 1
+        attempt = total_attempts
+        parsed, status, raw = await app_client.call_gemini_app_page(
+            page=page,
+            client=client,
+            selected_model=selected_model,
+            model_key=model,
+            model_info=model_info,
+            request_timeout=request_timeout,
+        )
+        status = {
+            **status,
+            "model": model,
+            "model_info": model_info,
+            "transport": "gemini_webapi",
+            "credential_source": credential_source,
+        }
+        raw_rows.append({
+            "page_id": page["page_id"],
+            "attempt": attempt,
+            "model": model,
+            "model_info": model_info,
+            "transport": "gemini_webapi",
+            "ok": status.get("ok", False),
+            "raw_response": raw,
+            "created_at": utc_now(),
+        })
+        if parsed is None:
+            if is_quota_status(status):
+                delay = retry_after_seconds(status)
+                final_status = {**status, "attempt": attempt, "status": "quota_backoff", "retry_after_seconds": delay}
+                print(f"Gemini App quota backoff {delay:.1f}s for {page['page_id']}", flush=True)
+                await asyncio.sleep(delay)
+                continue
+            invalid_attempts += 1
+            final_status = {**status, "attempt": attempt, "status": "call_failed"}
+            await asyncio.sleep(float(os.getenv("GEMINI_RETRY_SLEEP_SECONDS", "1.0")))
+            continue
+
+        ok, errors, normalized = validate_teacher_payload(parsed, min_confidence)
+        if not ok:
+            invalid_attempts += 1
+        final_status = {
+            **status,
+            "attempt": attempt,
+            "status": "accepted" if ok else "invalid_json_or_quality",
+            "validation_errors": errors,
+            "confidence": normalized["confidence"],
+        }
+        if ok:
+            accepted = normalized
+            break
+        await asyncio.sleep(float(os.getenv("GEMINI_RETRY_SLEEP_SECONDS", "1.0")))
+
+    run_row = {
+        "page_id": page["page_id"],
+        "source_path": page["source_path"],
+        "corpus": page["corpus"],
+        "attempts": final_status.get("attempt", 0),
+        "model": model,
+        "model_info": model_info,
+        "transport": "gemini_webapi",
+        "credential_source": credential_source,
+        "status": final_status.get("status", "failed"),
+        "ok": accepted is not None,
+        "confidence": final_status.get("confidence"),
+        "validation_errors": final_status.get("validation_errors", []),
+        "error_type": final_status.get("error_type"),
+        "error": final_status.get("error"),
+        "finish_reasons": final_status.get("finish_reasons", []),
+        "elapsed_seconds": final_status.get("elapsed_seconds"),
+        "thought_part_count": final_status.get("thought_part_count"),
+        "retry_after_seconds": final_status.get("retry_after_seconds"),
+        "created_at": utc_now(),
+    }
+    failure_row = None
+    gold = None
+    if accepted:
+        gold = build_fir_gita_gold(page, accepted, final_status)
+    else:
+        failure_row = {
+            "page_id": page["page_id"],
+            "source_path": page["source_path"],
+            "corpus": page["corpus"],
+            "attempts": final_status.get("attempt", 0),
+            "model": model,
+            "model_info": model_info,
+            "transport": "gemini_webapi",
+            "credential_source": credential_source,
+            "status": final_status.get("status", "failed"),
+            "validation_errors": final_status.get("validation_errors", []),
+            "error_type": final_status.get("error_type"),
+            "finish_reasons": final_status.get("finish_reasons", []),
+            "elapsed_seconds": final_status.get("elapsed_seconds"),
+            "thought_part_count": final_status.get("thought_part_count"),
+            "retry_after_seconds": final_status.get("retry_after_seconds"),
+            "created_at": utc_now(),
+            "error": final_status.get("error"),
+        }
+    return {"raw_rows": raw_rows, "run_row": run_row, "failure_row": failure_row, "gold": gold}
+
+
+async def run_gemini_app_annotations(
+    paths: dict[str, Path],
+    pending_pages: list[dict[str, Any]],
+    gold_rows: list[dict[str, Any]],
+    gold_by_page: dict[str, dict[str, Any]],
+    *,
+    model: str,
+    app_model: str,
+    min_confidence: float,
+    min_request_interval: float,
+    options: argparse.Namespace | None,
+) -> list[dict[str, Any]]:
+    import gemini_app_client as app_client
+
+    gold_path = paths["gold"] / "fir_gita_golden_documents.jsonl"
+    run_path = paths["reports"] / "gemini_teacher_runs.jsonl"
+    failure_path = paths["reports"] / "gemini_failures.jsonl"
+    raw_path = paths["reports"] / "gemini_raw_responses.jsonl"
+    credential_source = "environment"
+    if bool(getattr(options, "browser_extract_cookies", False)):
+        credential_source = extract_gemini_app_browser_cookies()
+    psid, psidts, loaded_source = app_client.load_webapi_credentials()
+    if credential_source == "environment":
+        credential_source = loaded_source
+
+    previous_cookie_path = os.environ.get("GEMINI_COOKIE_PATH")
+    temporary_cookie_cache: tempfile.TemporaryDirectory[str] | None = None
+    if previous_cookie_path is None:
+        temporary_cookie_cache = tempfile.TemporaryDirectory(prefix="gemini_webapi_cookie_cache_")
+        os.environ["GEMINI_COOKIE_PATH"] = temporary_cookie_cache.name
+
+    client = None
+    try:
+        client = await app_client.init_app_client(
+            psid,
+            psidts,
+            proxy=getattr(options, "gemini_app_proxy", None),
+            init_timeout=float(getattr(options, "gemini_app_init_timeout", 60) or 60),
+            verbose=env_flag("GEMINI_APP_VERBOSE", False),
+        )
+        selected_model, model_info = app_client.resolve_requested_model(client, app_model)
+        request_lock = asyncio.Lock()
+        last_request_at = {"value": 0.0}
+        concurrency = max(1, int(os.getenv("GEMINI_CONCURRENCY", "4")))
+        quota_stop_count = max(0, int(os.getenv("GEMINI_STOP_ON_QUOTA_COUNT", "3")))
+        quota_streak = 0
+        completed = 0
+        total_to_attempt = len(pending_pages)
+        request_timeout = float(getattr(options, "gemini_app_request_timeout", 300) or 300)
+        stop_submitting = False
+        next_page_index = 0
+
+        while next_page_index < total_to_attempt and not stop_submitting:
+            batch = pending_pages[next_page_index:next_page_index + concurrency]
+            next_page_index += len(batch)
+            results = await asyncio.gather(*[
+                annotate_gemini_app_page(
+                    page,
+                    client,
+                    selected_model,
+                    model,
+                    model_info,
+                    credential_source,
+                    min_confidence,
+                    request_lock,
+                    last_request_at,
+                    min_request_interval,
+                    request_timeout,
+                )
+                for page in batch
+            ])
+            for result in results:
+                for raw_row in result["raw_rows"]:
+                    jsonl_append(raw_path, raw_row)
+                jsonl_append(run_path, result["run_row"])
+                if result["gold"]:
+                    gold_rows.append(result["gold"])
+                    gold_by_page[result["gold"]["source_page_id"]] = result["gold"]
+                    jsonl_append(gold_path, result["gold"])
+                elif result["failure_row"]:
+                    jsonl_append(failure_path, result["failure_row"])
+                completed += 1
+
+                if is_quota_status(result["run_row"]):
+                    quota_streak += 1
+                    if quota_stop_count and quota_streak >= quota_stop_count and not stop_submitting:
+                        stop_submitting = True
+                        print(
+                            "Gemini App quota early stop after "
+                            f"{quota_streak} consecutive quota backoffs "
+                            f"({completed}/{total_to_attempt} pages finished)",
+                            flush=True,
+                        )
+                else:
+                    quota_streak = 0
+
+                if completed % 10 == 0:
+                    print(f"Gemini App FIR/Gita attempts {completed}/{total_to_attempt} pending ({len(gold_rows)} accepted total)", flush=True)
+    finally:
+        if client is not None:
+            await client.close()
+        if temporary_cookie_cache:
+            temporary_cookie_cache.cleanup()
+        if previous_cookie_path is None:
+            os.environ.pop("GEMINI_COOKIE_PATH", None)
+        else:
+            os.environ["GEMINI_COOKIE_PATH"] = previous_cookie_path
+
+    return gold_rows
+
+
 def gemini_annotate_fir_gita(
     paths: dict[str, Path],
     pages: list[dict[str, Any]],
     *,
     max_pages: int | None,
     skip_gemini: bool,
+    options: argparse.Namespace | None = None,
 ) -> list[dict[str, Any]]:
     target_pages = [p for p in pages if p["corpus"] in {"fir", "gita"}]
+    transport = gemini_transport_from_args(options)
     api_key = os.getenv("GEMINI_API_KEY", "")
-    model = os.getenv("GEMINI_TEACHER_MODEL", "gemma-4-31b-it")
+    app_model = gemini_app_model_from_args(options)
+    model = active_teacher_model(options)
     min_confidence = float(os.getenv("GEMINI_MIN_CONFIDENCE", "0.60"))
     gold_path = paths["gold"] / "fir_gita_golden_documents.jsonl"
     run_path = paths["reports"] / "gemini_teacher_runs.jsonl"
@@ -1947,9 +2248,17 @@ def gemini_annotate_fir_gita(
     pending_pages: list[dict[str, Any]] = []
     min_request_interval = float(os.getenv("GEMINI_MIN_REQUEST_INTERVAL_SECONDS", "3.2"))
     quota_cooldown_remaining = quota_cooldown_remaining_seconds(current_model_runs)
-    if quota_cooldown_remaining > 0 and not skip_gemini and api_key:
+    app_credentials_present = (
+        bool(os.getenv("GEMINI_WEBAPI_SECURE_1PSID") and os.getenv("GEMINI_WEBAPI_SECURE_1PSIDTS"))
+        or bool(getattr(options, "browser_extract_cookies", False))
+    )
+    can_attempt = not skip_gemini and (
+        (transport == "official" and bool(api_key))
+        or (transport == "app" and app_credentials_present)
+    )
+    if quota_cooldown_remaining > 0 and can_attempt:
         print(
-            "Gemini quota cooldown active; skipping API calls for "
+            f"Gemini {transport} quota cooldown active; skipping API calls for "
             f"{quota_cooldown_remaining:.1f}s",
             flush=True,
         )
@@ -1960,12 +2269,18 @@ def gemini_annotate_fir_gita(
             continue
         if current_model_failed_attempts.get(page["page_id"], 0) >= max_page_attempts:
             continue
-        if skip_gemini or not api_key:
+        if not can_attempt:
+            missing_status = "not_attempted_gemini_disabled"
+            if not skip_gemini and transport == "official":
+                missing_status = "not_attempted_missing_api_key"
+            elif not skip_gemini and transport == "app":
+                missing_status = "not_attempted_missing_app_credentials"
             row = {
                 "page_id": page["page_id"],
-                "status": "not_attempted_gemini_disabled" if skip_gemini else "not_attempted_missing_api_key",
+                "status": missing_status,
                 "attempts": 0,
                 "model": model,
+                "transport": "gemini_webapi" if transport == "app" else "official_api",
                 "created_at": utc_now(),
             }
             jsonl_append(run_path, row)
@@ -1980,6 +2295,21 @@ def gemini_annotate_fir_gita(
     ))
     if max_pages is not None and len(pending_pages) > max_pages:
         pending_pages = pending_pages[:max_pages]
+    if not pending_pages:
+        return gold_rows
+
+    if transport == "app":
+        return asyncio.run(run_gemini_app_annotations(
+            paths,
+            pending_pages,
+            gold_rows,
+            gold_by_page,
+            model=model,
+            app_model=app_model,
+            min_confidence=min_confidence,
+            min_request_interval=min_request_interval,
+            options=options,
+        ))
 
     request_lock = threading.Lock()
     last_request_at = {"value": 0.0}
@@ -2353,8 +2683,9 @@ def is_fir_gita_tracking_row(row: dict[str, Any]) -> bool:
     return row.get("corpus") in FIR_GITA_CORPORA or str(row.get("page_id", "")).startswith(("fir:", "gita:"))
 
 
-def verify_completion(paths: dict[str, Path]) -> dict[str, Any]:
-    teacher_model = os.getenv("GEMINI_TEACHER_MODEL", "gemma-4-31b-it")
+def verify_completion(paths: dict[str, Path], options: argparse.Namespace | None = None) -> dict[str, Any]:
+    transport = gemini_transport_from_args(options)
+    teacher_model = active_teacher_model(options)
     ingestion = jsonl_read(paths["manifests"] / "ingestion_manifest.jsonl")
     pages = jsonl_read(paths["manifests"] / "page_manifest.jsonl")
     fir_gita_gold_all = jsonl_read(paths["gold"] / "fir_gita_golden_documents.jsonl")
@@ -2446,6 +2777,7 @@ def verify_completion(paths: dict[str, Path]) -> dict[str, Any]:
             "expected_pages_from_valid_sources": valid_pages_expected,
             "page_manifest_rows": len(pages),
             "missing_render_paths": missing_render_paths[:20],
+            "gemini_transport": transport,
             "teacher_model": teacher_model,
             "teacher_run_rows": len(teacher_runs),
             "historical_run_rows": len(gemini_runs),
@@ -2478,8 +2810,9 @@ def verify_completion(paths: dict[str, Path]) -> dict[str, Any]:
     return audit
 
 
-def verify_fir_gita_completion(paths: dict[str, Path]) -> dict[str, Any]:
-    teacher_model = os.getenv("GEMINI_TEACHER_MODEL", "gemma-4-31b-it")
+def verify_fir_gita_completion(paths: dict[str, Path], options: argparse.Namespace | None = None) -> dict[str, Any]:
+    transport = gemini_transport_from_args(options)
+    teacher_model = active_teacher_model(options)
     ingestion = [row for row in jsonl_read(paths["manifests"] / "ingestion_manifest.jsonl") if row.get("corpus") in FIR_GITA_CORPORA]
     pages = [page for page in jsonl_read(paths["manifests"] / "page_manifest.jsonl") if page.get("corpus") in FIR_GITA_CORPORA]
     fir_gita_gold_all = jsonl_read(paths["gold"] / "fir_gita_golden_documents.jsonl")
@@ -2558,6 +2891,7 @@ def verify_fir_gita_completion(paths: dict[str, Path]) -> dict[str, Any]:
             "expected_pages_from_valid_sources": valid_pages_expected,
             "page_manifest_rows": len(pages),
             "missing_render_paths": missing_render_paths[:20],
+            "gemini_transport": transport,
             "teacher_model": teacher_model,
             "teacher_run_rows": len(teacher_runs),
             "historical_run_rows": len(gemini_runs),
@@ -2629,12 +2963,12 @@ def run_fir_gita(args: argparse.Namespace) -> int:
     for page in pages:
         page["split"] = assignments.get(page["split_group_id"])
     jsonl_write(paths["manifests"] / "page_manifest.jsonl", pages)
-    fir_gita_gold = gemini_annotate_fir_gita(paths, pages, max_pages=args.gemini_max_pages, skip_gemini=args.skip_gemini)
+    fir_gita_gold = gemini_annotate_fir_gita(paths, pages, max_pages=args.gemini_max_pages, skip_gemini=args.skip_gemini, options=args)
     ft_rows = make_fir_gita_only_exports(paths, fir_gita_gold)
     calibration = make_calibration(paths, ft_rows)
     verify_chat_template(paths, ft_rows)
     evaluate(paths, pages, fir_gita_gold, [], ft_rows, calibration)
-    audit = verify_fir_gita_completion(paths)
+    audit = verify_fir_gita_completion(paths, args)
     print(json.dumps({"output": str(paths["output"]), "all_complete": audit["all_complete"], "checks": audit["checks"]}, indent=2, sort_keys=True))
     return 0 if audit["all_complete"] else 2
 
@@ -2656,13 +2990,13 @@ def run_all(args: argparse.Namespace) -> int:
     jsonl_write(paths["manifests"] / "page_manifest.jsonl", pages)
     text_index = extract_sc_text(paths, rows)
     _, alignments = build_sc_pairs_and_alignment(paths, rows, pages, text_index)
-    fir_gita_gold = gemini_annotate_fir_gita(paths, pages, max_pages=args.gemini_max_pages, skip_gemini=args.skip_gemini)
+    fir_gita_gold = gemini_annotate_fir_gita(paths, pages, max_pages=args.gemini_max_pages, skip_gemini=args.skip_gemini, options=args)
     sc_gold = build_sc_gold(paths, pages, alignments)
     ft_rows = make_ft_exports(paths, fir_gita_gold, sc_gold)
     calibration = make_calibration(paths, ft_rows)
     verify_chat_template(paths, ft_rows)
     evaluate(paths, pages, fir_gita_gold, sc_gold, ft_rows, calibration)
-    audit = verify_completion(paths)
+    audit = verify_completion(paths, args)
     print(json.dumps({"output": str(paths["output"]), "all_complete": audit["all_complete"], "checks": audit["checks"]}, indent=2, sort_keys=True))
     return 0 if audit["all_complete"] else 2
 
@@ -2678,7 +3012,7 @@ def run_organize(args: argparse.Namespace) -> int:
 def run_verify(args: argparse.Namespace) -> int:
     load_dotenv()
     paths = mkdirs(output_from_args(args))
-    audit = verify_completion(paths)
+    audit = verify_completion(paths, args)
     print(json.dumps(audit, indent=2, sort_keys=True))
     return 0 if audit["all_complete"] else 2
 
@@ -2686,7 +3020,7 @@ def run_verify(args: argparse.Namespace) -> int:
 def run_verify_fir_gita(args: argparse.Namespace) -> int:
     load_dotenv()
     paths = mkdirs(output_from_args(args))
-    audit = verify_fir_gita_completion(paths)
+    audit = verify_fir_gita_completion(paths, args)
     print(json.dumps(audit, indent=2, sort_keys=True))
     return 0 if audit["all_complete"] else 2
 
@@ -2694,8 +3028,8 @@ def run_verify_fir_gita(args: argparse.Namespace) -> int:
 def run_status(args: argparse.Namespace) -> int:
     load_dotenv()
     paths = mkdirs(output_from_args(args))
-    teacher_model = os.getenv("GEMINI_TEACHER_MODEL", "gemma-4-31b-it")
-    audit = verify_completion(paths)
+    teacher_model = active_teacher_model(args)
+    audit = verify_completion(paths, args)
     pages = jsonl_read(paths["manifests"] / "page_manifest.jsonl")
     runs = jsonl_read(paths["reports"] / "gemini_teacher_runs.jsonl")
     teacher_runs = [row for row in runs if row.get("model") == teacher_model]
@@ -2726,6 +3060,7 @@ def run_status(args: argparse.Namespace) -> int:
     latest_quota_detail = quota_detail_fields(latest_quota) if latest_quota else {}
     status = {
         "output": str(paths["output"]),
+        "gemini_transport": gemini_transport_from_args(args),
         "all_complete": audit.get("all_complete"),
         "failed_checks": [key for key, ok in audit.get("checks", {}).items() if not ok],
         "fir_gita_pages": len(fir_gita_pages),
@@ -2763,8 +3098,8 @@ def run_status(args: argparse.Namespace) -> int:
 def run_status_fir_gita(args: argparse.Namespace) -> int:
     load_dotenv()
     paths = mkdirs(output_from_args(args))
-    teacher_model = os.getenv("GEMINI_TEACHER_MODEL", "gemma-4-31b-it")
-    audit = verify_fir_gita_completion(paths)
+    teacher_model = active_teacher_model(args)
+    audit = verify_fir_gita_completion(paths, args)
     pages = [page for page in jsonl_read(paths["manifests"] / "page_manifest.jsonl") if page.get("corpus") in FIR_GITA_CORPORA]
     runs = jsonl_read(paths["reports"] / "gemini_teacher_runs.jsonl")
     teacher_runs = [row for row in runs if row.get("model") == teacher_model and is_fir_gita_tracking_row(row)]
@@ -2794,6 +3129,7 @@ def run_status_fir_gita(args: argparse.Namespace) -> int:
     status = {
         "output": str(paths["output"]),
         "scope": "fir_gita_only",
+        "gemini_transport": gemini_transport_from_args(args),
         "all_complete": audit.get("all_complete"),
         "failed_checks": [key for key, ok in audit.get("checks", {}).items() if not ok],
         "fir_gita_pages": len(pages),
@@ -2849,12 +3185,12 @@ def run_resume_fir_gita(args: argparse.Namespace) -> int:
     fir_gita_pages = [page for page in pages if page.get("corpus") in FIR_GITA_CORPORA]
     if not fir_gita_pages:
         raise RuntimeError("No FIR/Gita pages found in page_manifest.jsonl.")
-    fir_gita_gold = gemini_annotate_fir_gita(paths, fir_gita_pages, max_pages=args.gemini_max_pages, skip_gemini=args.skip_gemini)
+    fir_gita_gold = gemini_annotate_fir_gita(paths, fir_gita_pages, max_pages=args.gemini_max_pages, skip_gemini=args.skip_gemini, options=args)
     ft_rows = make_fir_gita_only_exports(paths, fir_gita_gold)
     calibration = make_calibration(paths, ft_rows)
     verify_chat_template(paths, ft_rows)
     evaluate(paths, fir_gita_pages, fir_gita_gold, [], ft_rows, calibration)
-    audit = verify_fir_gita_completion(paths)
+    audit = verify_fir_gita_completion(paths, args)
     print(json.dumps({"output": str(paths["output"]), "all_complete": audit["all_complete"], "checks": audit["checks"]}, indent=2, sort_keys=True))
     return 0 if audit["all_complete"] else 2
 
@@ -2870,13 +3206,13 @@ def run_resume_gemini(args: argparse.Namespace) -> int:
     for page in pages:
         page["split"] = page.get("split") or assignments.get(page["split_group_id"])
     alignments = rebuild_sc_alignment_from_existing(paths, pages)
-    fir_gita_gold = gemini_annotate_fir_gita(paths, pages, max_pages=args.gemini_max_pages, skip_gemini=args.skip_gemini)
+    fir_gita_gold = gemini_annotate_fir_gita(paths, pages, max_pages=args.gemini_max_pages, skip_gemini=args.skip_gemini, options=args)
     sc_gold = build_sc_gold(paths, pages, alignments)
     ft_rows = make_ft_exports(paths, fir_gita_gold, sc_gold)
     calibration = make_calibration(paths, ft_rows)
     verify_chat_template(paths, ft_rows)
     evaluate(paths, pages, fir_gita_gold, sc_gold, ft_rows, calibration)
-    audit = verify_completion(paths)
+    audit = verify_completion(paths, args)
     print(json.dumps({"output": str(paths["output"]), "all_complete": audit["all_complete"], "checks": audit["checks"]}, indent=2, sort_keys=True))
     return 0 if audit["all_complete"] else 2
 
@@ -2884,7 +3220,7 @@ def run_resume_gemini(args: argparse.Namespace) -> int:
 def run_finalize_fir_gita(args: argparse.Namespace) -> int:
     load_dotenv()
     paths = mkdirs(output_from_args(args))
-    teacher_model = os.getenv("GEMINI_TEACHER_MODEL", "gemma-4-31b-it")
+    teacher_model = active_teacher_model(args)
     pages = load_pages_with_existing_splits(paths)
     if not pages:
         raise RuntimeError("Missing page_manifest.jsonl; run run-fir-gita once before finalize-fir-gita.")
@@ -2896,7 +3232,7 @@ def run_finalize_fir_gita(args: argparse.Namespace) -> int:
     calibration = make_calibration(paths, ft_rows)
     verify_chat_template(paths, ft_rows)
     evaluate(paths, fir_gita_pages, fir_gita_gold, [], ft_rows, calibration)
-    audit = verify_fir_gita_completion(paths)
+    audit = verify_fir_gita_completion(paths, args)
     print(json.dumps({"output": str(paths["output"]), "all_complete": audit["all_complete"], "checks": audit["checks"]}, indent=2, sort_keys=True))
     return 0 if audit["all_complete"] else 2
 
@@ -2904,7 +3240,7 @@ def run_finalize_fir_gita(args: argparse.Namespace) -> int:
 def run_finalize_existing(args: argparse.Namespace) -> int:
     load_dotenv()
     paths = mkdirs(output_from_args(args))
-    teacher_model = os.getenv("GEMINI_TEACHER_MODEL", "gemma-4-31b-it")
+    teacher_model = active_teacher_model(args)
     pages = jsonl_read(paths["manifests"] / "page_manifest.jsonl")
     if not pages:
         raise RuntimeError("Missing page_manifest.jsonl; run the full pipeline once before finalize-existing.")
@@ -2919,9 +3255,31 @@ def run_finalize_existing(args: argparse.Namespace) -> int:
     calibration = make_calibration(paths, ft_rows)
     verify_chat_template(paths, ft_rows)
     evaluate(paths, pages, fir_gita_gold, sc_gold, ft_rows, calibration)
-    audit = verify_completion(paths)
+    audit = verify_completion(paths, args)
     print(json.dumps({"output": str(paths["output"]), "all_complete": audit["all_complete"], "checks": audit["checks"]}, indent=2, sort_keys=True))
     return 0 if audit["all_complete"] else 2
+
+
+def add_gemini_transport_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--gemini-transport",
+        choices=["app", "official"],
+        default=None,
+        help="Gemini transport for FIR/Gita OCR. Defaults to GEMINI_TRANSPORT or app.",
+    )
+    parser.add_argument(
+        "--gemini-app-model",
+        default=None,
+        help="Gemini App model selector. Defaults to GEMINI_APP_MODEL or auto-flash.",
+    )
+    parser.add_argument("--gemini-app-init-timeout", type=float, default=60)
+    parser.add_argument("--gemini-app-request-timeout", type=float, default=300)
+    parser.add_argument("--gemini-app-proxy", default=None)
+    parser.add_argument(
+        "--browser-extract-cookies",
+        action="store_true",
+        help="Extract Gemini App cookies from the local CDP browser before annotation.",
+    )
 
 
 def main(argv: list[str]) -> int:
@@ -2930,6 +3288,7 @@ def main(argv: list[str]) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("organize")
     all_p = sub.add_parser("all")
+    add_gemini_transport_args(all_p)
     all_p.add_argument("--smoke", action="store_true", help="Run the small plan smoke subset instead of the full corpus.")
     all_p.add_argument("--smoke-fir-docs", type=int, default=2)
     all_p.add_argument("--smoke-gita-pages", type=int, default=2)
@@ -2937,13 +3296,16 @@ def main(argv: list[str]) -> int:
     all_p.add_argument("--gemini-max-pages", type=int, default=None, help="Cap FIR/Gita Gemini attempts for controlled tests.")
     all_p.add_argument("--skip-gemini", action="store_true", help="Do not call Gemini; audit will remain incomplete.")
     fir_gita_p = sub.add_parser("run-fir-gita", help="Run only the FIR/Gita synthetic OCR pipeline.")
+    add_gemini_transport_args(fir_gita_p)
     fir_gita_p.add_argument("--smoke", action="store_true", help="Run a small FIR/Gita-only smoke subset.")
     fir_gita_p.add_argument("--smoke-fir-docs", type=int, default=2)
     fir_gita_p.add_argument("--smoke-gita-pages", type=int, default=2)
     fir_gita_p.add_argument("--gemini-max-pages", type=int, default=None, help="Cap FIR/Gita Gemini attempts for controlled tests.")
     fir_gita_p.add_argument("--skip-gemini", action="store_true", help="Do not call Gemini; audit will remain incomplete.")
     verify_p = sub.add_parser("verify")
-    sub.add_parser("verify-fir-gita", help="Verify a FIR/Gita-only output directory.")
+    add_gemini_transport_args(verify_p)
+    verify_fir_gita_p = sub.add_parser("verify-fir-gita", help="Verify a FIR/Gita-only output directory.")
+    add_gemini_transport_args(verify_fir_gita_p)
     sub.add_parser("verify-sc-alignment")
     report_verify_p = sub.add_parser("report-sc-verification")
     report_verify_p.add_argument("--report-name", default="sc_page_content_verification_report.md", help="Full deterministic SC verification report filename under reports.")
@@ -2951,17 +3313,23 @@ def main(argv: list[str]) -> int:
     report_verify_p.add_argument("--review-manifest-name", default="sc_page_content_verification_review_manifest.jsonl", help="Review manifest filename under reports.")
     report_verify_p.add_argument("--max-examples", type=int, default=25, help="Number of review-needed rows to show in the Markdown report.")
     status_p = sub.add_parser("status")
+    add_gemini_transport_args(status_p)
     status_p.add_argument("--latest", type=int, default=50, help="Number of latest Gemini run rows to summarize.")
     status_fir_gita_p = sub.add_parser("status-fir-gita", help="Summarize a FIR/Gita-only run.")
+    add_gemini_transport_args(status_fir_gita_p)
     status_fir_gita_p.add_argument("--latest", type=int, default=50, help="Number of latest Gemini run rows to summarize.")
     resume_p = sub.add_parser("resume-gemini")
+    add_gemini_transport_args(resume_p)
     resume_p.add_argument("--gemini-max-pages", type=int, default=None, help="Cap FIR/Gita Gemini attempts for controlled tests.")
     resume_p.add_argument("--skip-gemini", action="store_true", help="Do not call Gemini; audit will remain incomplete.")
     resume_fir_gita_p = sub.add_parser("resume-fir-gita", help="Resume only FIR/Gita Gemini OCR annotation.")
+    add_gemini_transport_args(resume_fir_gita_p)
     resume_fir_gita_p.add_argument("--gemini-max-pages", type=int, default=None, help="Cap FIR/Gita Gemini attempts for controlled tests.")
     resume_fir_gita_p.add_argument("--skip-gemini", action="store_true", help="Do not call Gemini; audit will remain incomplete.")
-    sub.add_parser("finalize-existing")
-    sub.add_parser("finalize-fir-gita", help="Rebuild only FIR/Gita exports from existing Gemini gold.")
+    finalize_existing_p = sub.add_parser("finalize-existing")
+    add_gemini_transport_args(finalize_existing_p)
+    finalize_fir_gita_p = sub.add_parser("finalize-fir-gita", help="Rebuild only FIR/Gita exports from existing Gemini gold.")
+    add_gemini_transport_args(finalize_fir_gita_p)
     args = parser.parse_args(argv)
     if args.command == "organize":
         return run_organize(args)

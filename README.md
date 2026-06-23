@@ -34,6 +34,7 @@ workflow, see [inference.md](inference.md).
 .
 |-- scripts/
 |   |-- indic_ocr_v1_pipeline.py
+|   |-- gemini_app_client.py
 |   |-- gemini_app_browser_smoke.py
 |   |-- gemini_app_diagnostics.py
 |   |-- gemini_app_fir_gita_smoke.py
@@ -86,13 +87,17 @@ Create local environment settings:
 cp .env.example .env
 ```
 
-Set at least:
+The FIR/Gita OCR teacher defaults to Gemini App transport. Set at least:
 
 ```text
-GEMINI_API_KEY=your-api-key
+GEMINI_TRANSPORT=app
+GEMINI_WEBAPI_SECURE_1PSID=your-browser-cookie
+GEMINI_WEBAPI_SECURE_1PSIDTS=your-browser-cookie
 ```
 
-Useful defaults are provided in `.env.example`.
+Use `--browser-extract-cookies` with an already signed-in local CDP browser if
+you want the pipeline to read fresh cookies for a run. The official API remains
+available with `--gemini-transport official` and `GEMINI_API_KEY`.
 
 ## Data Inputs
 
@@ -127,7 +132,8 @@ Run a small smoke test:
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/page_only_v1_smoke \
   all \
-  --smoke
+  --smoke \
+  --gemini-transport app
 ```
 
 Run the full pipeline:
@@ -135,7 +141,8 @@ Run the full pipeline:
 ```bash
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/page_only_v1 \
-  all
+  all \
+  --gemini-transport app
 ```
 
 Run only the FIR/Gita synthetic OCR pipeline:
@@ -143,7 +150,8 @@ Run only the FIR/Gita synthetic OCR pipeline:
 ```bash
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/fir_gita_ocr_v1 \
-  run-fir-gita
+  run-fir-gita \
+  --gemini-transport app
 ```
 
 Resume only FIR/Gita Gemini OCR annotation:
@@ -152,7 +160,8 @@ Resume only FIR/Gita Gemini OCR annotation:
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/fir_gita_ocr_v1 \
   resume-fir-gita \
-  --gemini-max-pages 96
+  --gemini-max-pages 96 \
+  --gemini-transport app
 ```
 
 Rebuild only FIR/Gita exports from existing Gemini gold:
@@ -160,7 +169,8 @@ Rebuild only FIR/Gita exports from existing Gemini gold:
 ```bash
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/fir_gita_ocr_v1 \
-  finalize-fir-gita
+  finalize-fir-gita \
+  --gemini-transport app
 ```
 
 Check only FIR/Gita status or completion:
@@ -168,11 +178,13 @@ Check only FIR/Gita status or completion:
 ```bash
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/fir_gita_ocr_v1 \
-  status-fir-gita
+  status-fir-gita \
+  --gemini-transport app
 
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/fir_gita_ocr_v1 \
-  verify-fir-gita
+  verify-fir-gita \
+  --gemini-transport app
 ```
 
 Use a dedicated output directory such as `artifacts/fir_gita_ocr_v1` for the
@@ -186,7 +198,8 @@ Resume FIR/Gita Gemini annotation after an interrupted or quota-limited run:
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/page_only_v1 \
   resume-gemini \
-  --gemini-max-pages 96
+  --gemini-max-pages 96 \
+  --gemini-transport app
 ```
 
 Rebuild exports from existing gold and alignment artifacts:
@@ -194,7 +207,8 @@ Rebuild exports from existing gold and alignment artifacts:
 ```bash
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/page_only_v1 \
-  finalize-existing
+  finalize-existing \
+  --gemini-transport app
 ```
 
 Rebuild only Supreme Court deterministic page alignment:
@@ -218,7 +232,8 @@ Check run status:
 ```bash
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/page_only_v1 \
-  status
+  status \
+  --gemini-transport app
 ```
 
 Verify completion:
@@ -226,7 +241,8 @@ Verify completion:
 ```bash
 .venv/bin/python scripts/indic_ocr_v1_pipeline.py \
   --output artifacts/page_only_v1 \
-  verify
+  verify \
+  --gemini-transport app
 ```
 
 ## Long-Running Gemini Resume Loop
